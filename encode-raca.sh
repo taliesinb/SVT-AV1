@@ -1,5 +1,6 @@
 #!/bin/bash
 # encode-raca.sh IN.raw OUT.mp4 [options] [-- extra SvtAv1EncApp args]
+# (IN may be - to read the raw frames from stdin, as raca --hg-video streams them)
 #
 # Raw rgba64le frames (raca's 16-bit renderer output; alpha ignored) -> 10-bit 4:2:0 BT.709 limited-range y4m
 # (ffmpeg) -> SvtAv1EncApp from this fork with --dither-grain -> MP4 with BT.709 tags (ffmpeg, stream copy).
@@ -40,7 +41,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 APP=${SVTAV1ENCAPP:-$HERE/Bin/Release/SvtAv1EncApp}
 FFMPEG=${FFMPEG:-ffmpeg}
 [ -x "$APP" ] || { echo "SvtAv1EncApp not found at $APP (build: cmake -S . -B Build/release -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C Build/release SvtAv1EncApp)" >&2; exit 1; }
-[ -f "$IN" ] || { echo "no such input: $IN" >&2; exit 1; }
+[ "$IN" = - ] || [ -f "$IN" ] || { echo "no such input: $IN" >&2; exit 1; }
 
 IVF=${OUT%.*}.ivf
 GRAIN_ARGS=()
