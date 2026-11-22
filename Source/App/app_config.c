@@ -1,4 +1,4 @@
-﻿/*
+/*
 * Copyright(c) 2019 Intel Corporation
 *
 * This source code is subject to the terms of the BSD 3-Clause Clear License and
@@ -180,6 +180,8 @@
 #define MASTERING_DISPLAY_TOKEN "--mastering-display"
 #define CONTENT_LIGHT_LEVEL_TOKEN "--content-light"
 #define FGS_TABLE_TOKEN "--fgs-table"
+#define DITHER_GRAIN_TOKEN "--dither-grain"
+#define DITHER_GRAIN_CHROMA_TOKEN "--dither-grain-chroma"
 
 #define SFRAME_DIST_TOKEN "--sframe-dist"
 #define SFRAME_MODE_TOKEN "--sframe-mode"
@@ -463,6 +465,25 @@ static EbErrorType set_cfg_fgs_table_path(EbConfig* cfg, const char* token, cons
     fclose(file);
 
     return str_to_str(value, &cfg->fgs_table_path, token);
+}
+
+static EbErrorType str_to_amplitude(const char* token, const char* value, double* out) {
+    char*        end;
+    const double v = strtod(value, &end);
+    if (end == value || *end || !(v >= 0.0 && v <= 16.0)) {
+        fprintf(stderr, "Error: %s expects an amplitude in 8-bit steps in [0, 16], got '%s'\n", token, value);
+        return EB_ErrorBadParameter;
+    }
+    *out = v;
+    return EB_ErrorNone;
+}
+
+static EbErrorType set_cfg_dither_grain(EbConfig* cfg, const char* token, const char* value) {
+    return str_to_amplitude(token, value, &cfg->dither_grain);
+}
+
+static EbErrorType set_cfg_dither_grain_chroma(EbConfig* cfg, const char* token, const char* value) {
+    return str_to_amplitude(token, value, &cfg->dither_grain_chroma);
 }
 #endif
 static EbErrorType set_two_pass_stats(EbConfig* cfg, const char* token, const char* value) {
@@ -973,6 +994,11 @@ ConfigDescription config_entry_specific[] = {
      "still in frame header, 1: level of denoising is set by the film-grain parameter]"},
 
     {FGS_TABLE_TOKEN, "Set the film grain model table path"},
+    {DITHER_GRAIN_TOKEN,
+     "Signal designed white luma film grain that acts as display dither (no estimation), as "
+     "TPDF-equivalent amplitude in 8-bit steps, default is 0 [0: off, 0-16; 1 ~ +/-1 LSB at 8 bits]"},
+    {DITHER_GRAIN_CHROMA_TOKEN,
+     "Chroma amplitude for --dither-grain in 8-bit chroma steps, default is 0 [0-16]"},
 #endif
     // --- start: SUPER-RESOLUTION SUPPORT
     {SUPERRES_MODE_INPUT,
@@ -1198,6 +1224,8 @@ ConfigEntry config_entry[] = {
     {FILM_GRAIN_TOKEN, "FilmGrain", set_cfg_generic_token},
     {FILM_GRAIN_DENOISE_APPLY_TOKEN, "FilmGrainDenoise", set_cfg_generic_token},
     {FGS_TABLE_TOKEN, "FilmGrainTable", set_cfg_fgs_table_path},
+    {DITHER_GRAIN_TOKEN, "DitherGrain", set_cfg_dither_grain},
+    {DITHER_GRAIN_CHROMA_TOKEN, "DitherGrainChroma", set_cfg_dither_grain_chroma},
 #endif
 
     //   Super-resolution support
@@ -2397,6 +2425,27 @@ EbErrorType read_command_line(int32_t argc, char* const argv[], EncChannel* chan
         }
         channel->return_error = read_fgs_table(cfg);
         return_error          = (EbErrorType)(return_error & channel->return_error);
+    }
+    if (cfg->dither_grain > 0 || cfg->dither_grain_chroma > 0) {
+        if (cfg->fgs_table_path) {
+            fprintf(stderr, "Error: --dither-grain and --fgs-table are mutually exclusive\n");
+            channel->return_error = EB_ErrorBadParameter;
+        } else {
+            if (cfg->config.film_grain_denoise_strength > 0) {
+                fprintf(stderr, "Warning: --dither-grain replaces --film-grain estimation; film-grain disabled\n");
+                cfg->config.film_grain_denoise_strength = 0;
+            }
+            channel->return_error = make_dither_grain_table(&cfg->fgs_table,
+                                                            cfg->dither_grain,
+                                                            cfg->dither_grain_chroma,
+                                                            cfg->config.color_range == EB_CR_FULL_RANGE);
+            if (channel->return_error == EB_ErrorNone) {
+                cfg->config.fgs_table = &cfg->fgs_table.head->grain;
+            } else {
+                fprintf(stderr, "Error: could not build --dither-grain model\n");
+            }
+        }
+        return_error = (EbErrorType)(return_error & channel->return_error);
     }
 #endif
     /***************************************************************************************************/

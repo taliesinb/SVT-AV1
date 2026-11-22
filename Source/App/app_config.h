@@ -203,6 +203,10 @@ typedef struct EbConfig {
 
     char*          fgs_table_path;
     FilmGrainTable fgs_table;
+    // --dither-grain / --dither-grain-chroma: designed white film grain, as TPDF-equivalent amplitude in
+    // 8-bit code steps (0 = off). See make_dither_grain_table() in app_film_grain.c.
+    double dither_grain;
+    double dither_grain_chroma;
 } EbConfig;
 
 typedef struct EncChannel {

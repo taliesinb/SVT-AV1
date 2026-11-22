@@ -313,3 +313,19 @@ recommended to review the section of the code implementing this feature.
 
 [1] Andrey Norkin and Neil Birkbeck, “Film grain synthesis for AV1 video
 codec”, Data Compression Conference, 2018.
+
+## Designed dither grain (`--dither-grain`)
+
+`--dither-grain A` writes an analytic film grain model into every frame header instead of estimating grain:
+a flat luma scaling function, `ar_coeff_lag = 0` (white grain), `grain_scale_shift = 0`, no overlap, and a
+per-frame random seed. It is meant for smooth, undithered high-bit-depth sources (rendered gradients): encode at
+10 bits, where they compress well, and let the decoder add dither so 8-bit display paths do not band.
+
+`A` is the peak amplitude of the triangular (TPDF) dither with the same variance, in 8-bit code steps. With
+`std(Gaussian_Sequence) = 511.53`, the synthesized noise has standard deviation
+`s * 511.53 * 2^(B - 12 - ScalingShift)` codes at bit depth `B`, and one display step is `219/255 * 2^(B - 8)`
+luma codes (limited range), so the flat scaling value is
+`s = (A / sqrt(6)) * (219/255) * 2^(4 + ScalingShift) / 511.53`, e.g. `s = 22` for `A = 1`, `ScalingShift = 11`.
+`--dither-grain-chroma` adds chroma grain the same way (`224/255` per step). Luma grain moves R, G and B
+equally, so luma-only grain already dithers all display channels. `encode-raca.sh` in the repository root
+wraps raw `rgba64le` input → y4m → `SvtAv1EncApp --dither-grain` → BT.709-tagged MP4.

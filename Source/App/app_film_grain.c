@@ -205,3 +205,111 @@ void lookup_film_grain_table(FilmGrainTable* table, uint64_t frame, const EbSvtA
     }
     grain->bit_depth = config->encoder_bit_depth;
 }
+
+/*
+ * Designed "dither" film grain (--dither-grain): a white, signal-independent grain model whose
+ * synthesized noise has the variance of a triangular (TPDF) dither of the given peak amplitude, in
+ * 8-bit code steps. Encode a smooth, undithered 10-bit source and every conforming decoder adds the
+ * dither at output, so 8-bit display paths do not band.
+ *
+ * Calibration (AV1 spec 7.18.3, bit depth B, with ar_coeff_lag = 0 so the grain is white):
+ *   grain   = Round2(Gaussian_Sequence[r], 12 - B + grain_scale_shift)
+ *             std(Gaussian_Sequence) = 511.53 (the 2048-entry table; 12-bit values)
+ *             -> std(grain) = 511.53 * 2^(B - 12 - grain_scale_shift)
+ *   noise   = Round2(ScalingLut(x) * grain, ScalingShift), ScalingLut flat = s for all x
+ *             -> std(noise) = s * 511.53 * 2^(B - 12 - grain_scale_shift - ScalingShift)    [B-bit codes]
+ *   target  = std of TPDF with peak A display steps = A / sqrt(6) 8-bit steps,
+ *             one 8-bit step of display RGB is L * 2^(B - 8) codes, L = 219/255 (luma, limited range),
+ *             224/255 (chroma, limited range) or 1 (full range)
+ *   =>  s = (A / sqrt(6)) * L * 2^(4 + grain_scale_shift + ScalingShift) / 511.53   (independent of B)
+ *   e.g. A = 1, limited range, grain_scale_shift = 0, ScalingShift = 11: s = 22.46 -> 22.
+ * Luma noise moves R, G and B equally, so luma-only grain dithers all three display channels.
+ */
+#define DITHER_GAUSS_STD 511.53
+
+static int dither_scaling(double amplitude, double steps_per_lsb, int32_t* scaling_shift) {
+    for (int shift = 11; shift >= 8; --shift) {
+        const double s = amplitude / 2.449489742783178 * steps_per_lsb * (double)(1 << (4 + shift)) / DITHER_GAUSS_STD;
+        if (s <= 255.0) {
+            *scaling_shift = shift;
+            return (int)(s + 0.5);
+        }
+    }
+    *scaling_shift = 8;
+    return 255;
+}
+
+EbErrorType make_dither_grain_table(FilmGrainTable* table, double luma_amplitude, double chroma_amplitude,
+                                    bool full_range) {
+    FilmGrainEntry* e = calloc(1, sizeof(*e));
+    if (!e) {
+        return EB_ErrorInsufficientResources;
+    }
+    AomFilmGrain* g      = &e->grain;
+    g->apply_grain       = 1;
+    g->update_parameters = 1;
+    // Identical parameters on every frame: the encoder may then signal update_grain = 0 and load them
+    // from a reference frame; the random seed is still sent per frame and advanced in
+    // lookup_film_grain_table(), so the noise changes every frame (temporal dither).
+    g->ignore_ref        = 0;
+    g->random_seed       = 7391;
+    g->bit_depth         = 8;
+    g->ar_coeff_lag      = 0; // no auto-regression: white grain
+    g->ar_coeff_shift    = 6;
+    g->grain_scale_shift = 0;
+    g->overlap_flag      = 0; // white noise has no block seams to hide
+    g->clip_to_restricted_range = 0;
+    g->chroma_scaling_from_luma = 0;
+
+    int32_t luma_shift = 11, chroma_shift = 11;
+    const int s_y = luma_amplitude > 0 ? dither_scaling(luma_amplitude, full_range ? 1.0 : 219.0 / 255.0, &luma_shift)
+                                       : 0;
+    const int s_c = chroma_amplitude > 0
+        ? dither_scaling(chroma_amplitude, full_range ? 1.0 : 224.0 / 255.0, &chroma_shift)
+        : 0;
+    // One ScalingShift serves all planes: use the smaller one and rescale the other plane.
+    g->scaling_shift = luma_shift < chroma_shift ? luma_shift : chroma_shift;
+    const int y = s_y ? (luma_shift > g->scaling_shift ? (s_y + 1) >> (luma_shift - g->scaling_shift) : s_y) : 0;
+    const int c = s_c ? (chroma_shift > g->scaling_shift ? (s_c + 1) >> (chroma_shift - g->scaling_shift) : s_c) : 0;
+    if (!y && !c) {
+        free(e);
+        return EB_ErrorBadParameter;
+    }
+    // A flat scaling function needs two points; num_y_points = 0 would also disable 4:2:0 chroma grain,
+    // so keep a (zero) luma function when only chroma grain is requested.
+    g->num_y_points          = 2;
+    g->scaling_points_y[0][0] = 0;
+    g->scaling_points_y[0][1] = y;
+    g->scaling_points_y[1][0] = 255;
+    g->scaling_points_y[1][1] = y;
+    if (c) {
+        g->num_cb_points = g->num_cr_points = 2;
+        g->scaling_points_cb[0][0] = g->scaling_points_cr[0][0] = 0;
+        g->scaling_points_cb[1][0] = g->scaling_points_cr[1][0] = 255;
+        g->scaling_points_cb[0][1] = g->scaling_points_cb[1][1] = c;
+        g->scaling_points_cr[0][1] = g->scaling_points_cr[1][1] = c;
+        // index = cb * mult/64 + luma * (luma_mult - 128)/64 + (offset - 256) * 4: identity (irrelevant
+        // for a flat function, but keep it well-formed)
+        g->cb_mult = g->cr_mult = 128;
+        g->cb_luma_mult = g->cr_luma_mult = 192;
+        g->cb_offset = g->cr_offset = 256;
+    }
+    if (!svt_aom_film_grain_params_valid(g)) {
+        free(e);
+        return EB_ErrorBadParameter;
+    }
+    fprintf(stderr,
+            "SVT [dither-grain]: luma %.3g -> scaling %d, chroma %.3g -> scaling %d, scaling_shift %d, "
+            "grain_scale_shift 0, ar_coeff_lag 0 (white)\n",
+            luma_amplitude,
+            y,
+            chroma_amplitude,
+            c,
+            g->scaling_shift);
+    e->start_time  = 0;
+    e->end_time    = UINT64_MAX;
+    table->head    = e;
+    table->current = e;
+    table->seed    = g->random_seed;
+    return EB_ErrorNone;
+}

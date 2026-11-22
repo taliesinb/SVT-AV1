@@ -10,6 +10,7 @@
 #ifndef APP_FILM_GRAIN_H
 #define APP_FILM_GRAIN_H
 
+#include <stdbool.h>
 #include <stdio.h>
 #include "EbSvtAv1Enc.h"
 
@@ -32,6 +33,8 @@ typedef struct FilmGrainTable {
 
 EbErrorType read_film_grain_table(FILE* file, FilmGrainTable* table);
 void        free_film_grain_table(FilmGrainTable* table);
+EbErrorType make_dither_grain_table(FilmGrainTable* table, double luma_amplitude, double chroma_amplitude,
+                                    bool full_range);
 void        lookup_film_grain_table(FilmGrainTable* table, uint64_t frame, const EbSvtAv1EncConfiguration* config,
                                     AomFilmGrain* grain);
 
